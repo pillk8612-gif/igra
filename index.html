@@ -1,0 +1,312 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>MiniTerra Co-op</title>
+<style>
+  body { margin:0; background:#1a1a2e; color:#eee; font-family:system-ui,sans-serif; overflow:hidden; }
+  #hud { position:fixed; top:10px; left:10px; background:rgba(0,0,0,.55); padding:10px 14px;
+         border-radius:8px; font-size:14px; z-index:10; }
+  #hud b { color:#7cf; }
+  #code { position:fixed; top:10px; right:10px; background:rgba(0,0,0,.65); padding:10px 14px;
+          border-radius:8px; font-family:monospace; font-size:16px; letter-spacing:2px; z-index:10; }
+  #code small { display:block; font-size:10px; letter-spacing:0; opacity:.7; font-family:system-ui; }
+  canvas { display:block; cursor:crosshair; }
+  #tip { position:fixed; bottom:10px; left:10px; font-size:12px; opacity:.7; }
+  #players { position:fixed; bottom:10px; right:10px; background:rgba(0,0,0,.55);
+             padding:8px 12px; border-radius:8px; font-size:12px; z-index:10; }
+  #menu { position:fixed; inset:0; background:#12121f; display:flex; flex-direction:column;
+          align-items:center; justify-content:center; z-index:100; gap:14px; }
+  #menu h1 { margin:0 0 10px; color:#7cf; }
+  #menu input { padding:10px 14px; border-radius:8px; border:1px solid #333; background:#1e1e30;
+                color:#eee; font-size:15px; width:280px; }
+  #menu button { padding:10px 18px; border-radius:8px; border:none; background:#2d6cdf; color:#fff;
+                 font-size:15px; cursor:pointer; }
+  #menu button:hover { background:#3d7cef; }
+  #menu .row { display:flex; gap:10px; }
+  #err { color:#f77; font-size:13px; height:16px; }
+</style>
+</head>
+<body>
+
+<div id="menu">
+  <h1>MiniTerra Co-op</h1>
+  <input id="name" placeholder="Ваше имя" maxlength="16" value="Игрок">
+  <div class="row">
+    <button id="createBtn">Создать игру</button>
+  </div>
+  <div class="row">
+    <input id="codeInput" placeholder="Код комнаты (16 символов)" maxlength="16" style="text-transform:uppercase">
+    <button id="joinBtn">Подключиться</button>
+  </div>
+  <div id="err"></div>
+</div>
+
+<div id="hud">
+  Блок: <b id="blockName">Земля</b> (1-5)<br>
+  Координаты: <b id="pos">0,0</b>
+</div>
+<div id="code" style="display:none"><small>КОД КОМНАТЫ</small><span id="codeVal"></span></div>
+<div id="players"></div>
+<div id="tip">ЛКМ — копать/строить · ПКМ — удалить · WASD — движение · 1-5 — блок</div>
+
+<canvas id="game"></canvas>
+
+<script>
+const WS_URL = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W, H;
+function resize(){ W = canvas.width = innerWidth; H = canvas.height = innerHeight; }
+addEventListener('resize', resize); resize();
+
+const TILE = 32;
+const WORLD_W = 300, WORLD_H = 120;
+
+const BLOCKS = {
+  0: { name:'Воздух', color:null },
+  1: { name:'Земля',  color:'#7a5230' },
+  2: { name:'Трава',  color:'#3fa34d' },
+  3: { name:'Камень', color:'#777' },
+  4: { name:'Дерево', color:'#5a3a1a' },
+  5: { name:'Песок',  color:'#e0c56e' },
+};
+let currentBlock = 1;
+let world = null;
+let myId = null;
+const otherPlayers = new Map();
+
+const player = { x:0, y:0, w:22, h:42, vy:0, speed:4, onGround:false };
+const keys = {};
+let cam = { x:0, y:0 };
+
+let ws = null;
+let connected = false;
+let lastSend = 0;
+
+const menu = document.getElementById('menu');
+const errEl = document.getElementById('err');
+const codeBox = document.getElementById('code');
+const codeVal = document.getElementById('codeVal');
+const playersEl = document.getElementById('players');
+
+function connect(initMsg) {
+  errEl.textContent = '';
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => ws.send(JSON.stringify(initMsg));
+  ws.onerror = () => { errEl.textContent = 'Не удалось подключиться к серверу'; };
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'created' || msg.type === 'joined') {
+      codeVal.textContent = msg.code;
+      codeBox.style.display = 'block';
+      menu.style.display = 'none';
+      connected = true;
+    }
+    if (msg.type === 'error') { errEl.textContent = msg.message; ws.close(); }
+    if (msg.type === 'init') {
+      myId = msg.id;
+      world = msg.world;
+      // спавн на поверхности по центру
+      const cx = Math.floor(WORLD_W/2);
+      let surfY = 0;
+      for (let y = 0; y < WORLD_H; y++) { if (world[cx][y] !== 0) { surfY = y; break; } }
+      player.x = cx * TILE;
+      player.y = (surfY - 3) * TILE;
+      player.vy = 0;
+      otherPlayers.clear();
+      for (const p of msg.players) if (p.id !== myId) otherPlayers.set(p.id, p);
+      updatePlayersList();
+    }
+    if (msg.type === 'join') {
+      if (msg.id !== myId) { otherPlayers.set(msg.id, msg); updatePlayersList(); }
+    }
+    if (msg.type === 'leave') {
+      otherPlayers.delete(msg.id); updatePlayersList();
+    }
+    if (msg.type === 'move') {
+      const p = otherPlayers.get(msg.id);
+      if (p) { p.x = msg.x; p.y = msg.y; }
+    }
+    if (msg.type === 'block') {
+      if (world) world[msg.x][msg.y] = msg.b;
+    }
+  };
+  ws.onclose = () => { connected = false; };
+}
+
+function updatePlayersList() {
+  const list = ['Вы'];
+  for (const p of otherPlayers.values()) list.push(p.name || 'Игрок');
+  playersEl.textContent = 'Онлайн (' + (list.length) + '): ' + list.join(', ');
+}
+
+document.getElementById('createBtn').onclick = () => {
+  const name = document.getElementById('name').value || 'Игрок';
+  connect({ type:'create', name });
+};
+document.getElementById('joinBtn').onclick = () => {
+  const name = document.getElementById('name').value || 'Игрок';
+  const code = document.getElementById('codeInput').value.trim().toUpperCase();
+  if (code.length !== 16) { errEl.textContent = 'Код должен быть 16 символов'; return; }
+  connect({ type:'join', name, code });
+};
+
+addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key >= '1' && e.key <= '5') {
+    currentBlock = +e.key;
+    document.getElementById('blockName').textContent = BLOCKS[currentBlock].name;
+  }
+});
+addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+const mouse = { x:0, y:0, down:false, right:false };
+canvas.addEventListener('mousemove', e => { mouse.x = e.clientX; mouse.y = e.clientY; });
+canvas.addEventListener('mousedown', e => {
+  if (!connected) return;
+  if (e.button===0) mouse.down = true;
+  if (e.button===2) mouse.right = true;
+  e.preventDefault();
+});
+canvas.addEventListener('mouseup', e => {
+  if (e.button===0) mouse.down = false;
+  if (e.button===2) mouse.right = false;
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+
+function solidAt(tx, ty){
+  if (!world) return false;
+  if (tx < 0 || tx >= WORLD_W || ty < 0 || ty >= WORLD_H) return true;
+  return world[tx][ty] !== 0;
+}
+
+function movePlayer(){
+  if (!connected || !world) return;
+  if (keys['a'] || keys['arrowleft']) player.x -= player.speed;
+  if (keys['d'] || keys['arrowright']) player.x += player.speed;
+  player.vy += 0.6;
+  player.y += player.vy;
+
+  const left = Math.floor(player.x/TILE);
+  const right = Math.floor((player.x + player.w)/TILE);
+  const top = Math.floor(player.y/TILE);
+  const bottom = Math.floor((player.y + player.h)/TILE);
+
+  player.onGround = false;
+  if (player.vy > 0) {
+    for (let tx = left; tx <= right; tx++)
+      if (solidAt(tx, bottom)) { player.y = bottom*TILE - player.h; player.vy = 0; player.onGround = true; break; }
+  } else if (player.vy < 0) {
+    for (let tx = left; tx <= right; tx++)
+      if (solidAt(tx, top)) { player.y = (top+1)*TILE; player.vy = 0; break; }
+  }
+  if ((keys['w'] || keys[' ']) && player.onGround) player.vy = -11;
+
+  const feet = Math.floor((player.y + player.h - 1)/TILE);
+  const head = Math.floor((player.y + 1)/TILE);
+  const nl = Math.floor(player.x/TILE);
+  const nr = Math.floor((player.x + player.w)/TILE);
+  for (let ty = head; ty <= feet; ty++) {
+    if (solidAt(nl, ty) && player.x < nl*TILE + TILE) player.x = nl*TILE + TILE;
+    if (solidAt(nr, ty) && player.x + player.w > nr*TILE) player.x = nr*TILE - player.w;
+  }
+
+  // ограничение по миру
+  player.x = Math.max(0, Math.min(player.x, WORLD_W*TILE - player.w));
+  if (player.y > WORLD_H*TILE) { player.y = 0; player.vy = 0; }
+
+  // сеть — троттлинг 50 мс (~20 раз в секунду)
+  const now = performance.now();
+  if (now - lastSend > 50 && ws && ws.readyState === 1) {
+    lastSend = now;
+    ws.send(JSON.stringify({ type:'move', x: player.x, y: player.y }));
+  }
+}
+
+function tryAction(){
+  if (!connected || !world) return;
+  const tx = Math.floor((mouse.x + cam.x)/TILE);
+  const ty = Math.floor((mouse.y + cam.y)/TILE);
+  if (tx < 0 || tx >= WORLD_W || ty < 0 || ty >= WORLD_H) return;
+
+  if (mouse.down) {
+    const px1 = Math.floor(player.x/TILE), px2 = Math.floor((player.x+player.w)/TILE);
+    const py1 = Math.floor(player.y/TILE), py2 = Math.floor((player.y+player.h)/TILE);
+    if (tx>=px1 && tx<=px2 && ty>=py1 && ty<=py2) return;
+    if (world[tx][ty] === currentBlock) return;
+    ws.send(JSON.stringify({ type:'block', x:tx, y:ty, b:currentBlock }));
+    world[tx][ty] = currentBlock; // мгновенный локальный отклик
+  } else if (mouse.right) {
+    if (world[tx][ty] === 0) return;
+    ws.send(JSON.stringify({ type:'block', x:tx, y:ty, b:0 }));
+    world[tx][ty] = 0;
+  }
+}
+
+function updateCamera(){
+  cam.x = player.x + player.w/2 - W/2;
+  cam.y = player.y + player.h/2 - H/2;
+  cam.x = Math.max(0, Math.min(cam.x, WORLD_W*TILE - W));
+  cam.y = Math.max(0, Math.min(cam.y, WORLD_H*TILE - H));
+}
+
+function render(){
+  ctx.fillStyle = '#87b6e8';
+  ctx.fillRect(0,0,W,H);
+  if (!world) return;
+
+  const x0 = Math.max(0, Math.floor(cam.x/TILE));
+  const x1 = Math.min(WORLD_W, Math.ceil((cam.x+W)/TILE));
+  const y0 = Math.max(0, Math.floor(cam.y/TILE));
+  const y1 = Math.min(WORLD_H, Math.ceil((cam.y+H)/TILE));
+
+  for (let x = x0; x < x1; x++) {
+    for (let y = y0; y < y1; y++) {
+      const b = world[x][y];
+      if (!b) continue;
+      ctx.fillStyle = BLOCKS[b].color;
+      ctx.fillRect(x*TILE - cam.x, y*TILE - cam.y, TILE, TILE);
+      ctx.strokeStyle = 'rgba(0,0,0,.12)';
+      ctx.strokeRect(x*TILE - cam.x + .5, y*TILE - cam.y + .5, TILE-1, TILE-1);
+    }
+  }
+
+  for (const p of otherPlayers.values()) {
+    ctx.fillStyle = '#9be7ff';
+    ctx.fillRect(p.x - cam.x, p.y - cam.y, player.w, player.h);
+    ctx.fillStyle = '#333';
+    ctx.font = '12px system-ui';
+    ctx.textAlign = 'center';
+    ctx.fillText(p.name || '', p.x - cam.x + player.w/2, p.y - cam.y - 6);
+  }
+
+  ctx.fillStyle = '#ffd166';
+  ctx.fillRect(player.x - cam.x, player.y - cam.y, player.w, player.h);
+  ctx.fillStyle = '#e07a2f';
+  ctx.fillRect(player.x - cam.x + 4, player.y - cam.y + 6, 6, 6);
+  ctx.fillRect(player.x - cam.x + 12, player.y - cam.y + 6, 6, 6);
+
+  const tx = Math.floor((mouse.x + cam.x)/TILE);
+  const ty = Math.floor((mouse.y + cam.y)/TILE);
+  if (tx>=0 && tx<WORLD_W && ty>=0 && ty<WORLD_H) {
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(tx*TILE - cam.x, ty*TILE - cam.y, TILE, TILE);
+  }
+
+  document.getElementById('pos').textContent = `${Math.round(player.x/TILE)}, ${Math.round(player.y/TILE)}`;
+}
+
+let last = performance.now();
+function loop(now){
+  last = now;
+  if (connected) { movePlayer(); tryAction(); updateCamera(); }
+  render();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
